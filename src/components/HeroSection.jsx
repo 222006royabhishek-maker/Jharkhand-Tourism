@@ -2,51 +2,86 @@ import React, { useRef, useEffect, useState } from 'react';
 import { ChevronDown, Trees, Waves, Compass } from 'lucide-react';
 
 const TOTAL_FRAMES = 240;
+const KEYFRAME_STEP = 3; // Preload keyframes first (1 out of 3) for instant interaction
 
 export default function HeroSection({ onScrollToCarousel }) {
   const containerRef = useRef(null);
   const canvasRef = useRef(null);
-  const [images, setImages] = useState([]);
+  
+  // Store loaded images map: index -> HTMLImageElement
+  const imagesMapRef = useRef(new Map());
   const [loadedCount, setLoadedCount] = useState(0);
-  const [isLoaded, setIsLoaded] = useState(false);
+  const [isInitialReady, setIsInitialReady] = useState(false);
   const [scrollProgress, setScrollProgress] = useState(0);
 
   const currentFrameRef = useRef(0);
   const targetFrameRef = useRef(0);
 
-  // Preload frames
+  // Progressive Frame Loader: Instant rendering + Background Batch Loading
   useEffect(() => {
     let isMounted = true;
-    const loadedImages = [];
     let count = 0;
 
-    for (let i = 1; i <= TOTAL_FRAMES; i++) {
-      const img = new Image();
-      const frameNum = String(i).padStart(3, '0');
-      img.src = `/hero_images/ezgif-frame-${frameNum}.jpg`;
+    // Helper to load a single frame
+    const loadFrame = (frameIndex) => {
+      return new Promise((resolve) => {
+        const img = new Image();
+        const frameNum = String(frameIndex + 1).padStart(3, '0');
+        img.src = `/hero_images/ezgif-frame-${frameNum}.jpg`;
 
-      img.onload = () => {
-        if (!isMounted) return;
-        count++;
-        setLoadedCount(count);
-        if (count === TOTAL_FRAMES) {
-          setIsLoaded(true);
-        }
-      };
+        img.onload = () => {
+          if (!isMounted) return;
+          imagesMapRef.current.set(frameIndex, img);
+          count++;
+          setLoadedCount(count);
+          resolve(img);
+        };
 
-      img.onerror = () => {
-        if (!isMounted) return;
-        count++;
-        setLoadedCount(count);
-        if (count === TOTAL_FRAMES) {
-          setIsLoaded(true);
-        }
-      };
+        img.onerror = () => {
+          if (!isMounted) return;
+          count++;
+          setLoadedCount(count);
+          resolve(null);
+        };
+      });
+    };
 
-      loadedImages.push(img);
+    // Phase 1: Load Frame 0 INSTANTLY so canvas displays in < 50ms
+    loadFrame(0).then(() => {
+      if (isMounted) setIsInitialReady(true);
+    });
+
+    // Phase 2: Load Keyframes (every 3rd frame) in parallel for immediate smooth scroll responsiveness (~80 frames)
+    const keyframeIndices = [];
+    for (let i = 0; i < TOTAL_FRAMES; i += KEYFRAME_STEP) {
+      if (i !== 0) keyframeIndices.push(i);
     }
 
-    setImages(loadedImages);
+    Promise.all(keyframeIndices.map((idx) => loadFrame(idx))).then(() => {
+      if (!isMounted) return;
+
+      // Phase 3: Fill in remaining intermediate frames lazily in background batches
+      const remainingIndices = [];
+      for (let i = 0; i < TOTAL_FRAMES; i++) {
+        if (!imagesMapRef.current.has(i)) {
+          remainingIndices.push(i);
+        }
+      }
+
+      // Load remaining in small batches of 15 to keep main thread fast & unblocked
+      const loadInBatches = async () => {
+        const BATCH_SIZE = 15;
+        for (let i = 0; i < remainingIndices.length; i += BATCH_SIZE) {
+          if (!isMounted) break;
+          const batch = remainingIndices.slice(i, i + BATCH_SIZE);
+          await Promise.all(batch.map((idx) => loadFrame(idx)));
+          // Yield to main thread briefly
+          await new Promise((r) => setTimeout(r, 40));
+        }
+      };
+
+      loadInBatches();
+    });
 
     return () => {
       isMounted = false;
@@ -77,19 +112,37 @@ export default function HeroSection({ onScrollToCarousel }) {
     return () => window.removeEventListener('scroll', handleScroll);
   }, []);
 
-  // Canvas lerp render loop
+  // Intelligent Nearest-Frame Canvas Render Loop
   useEffect(() => {
-    if (!isLoaded || images.length === 0) return;
-
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d', { alpha: false });
     let animationFrameId;
 
+    // Find closest loaded frame if exact target frame is still downloading
+    const getBestAvailableImage = (targetIndex) => {
+      if (imagesMapRef.current.has(targetIndex)) {
+        return imagesMapRef.current.get(targetIndex);
+      }
+      
+      // Search backwards first, then forwards for nearest loaded keyframe
+      for (let delta = 1; delta < TOTAL_FRAMES; delta++) {
+        const prev = targetIndex - delta;
+        if (prev >= 0 && imagesMapRef.current.has(prev)) {
+          return imagesMapRef.current.get(prev);
+        }
+        const next = targetIndex + delta;
+        if (next < TOTAL_FRAMES && imagesMapRef.current.has(next)) {
+          return imagesMapRef.current.get(next);
+        }
+      }
+      return imagesMapRef.current.get(0) || null;
+    };
+
     const render = () => {
       currentFrameRef.current += (targetFrameRef.current - currentFrameRef.current) * 0.085;
       const frameIndex = Math.round(currentFrameRef.current);
-      const img = images[frameIndex] || images[0];
+      const img = getBestAvailableImage(frameIndex);
 
       if (img && img.complete) {
         const canvasWidth = window.innerWidth;
@@ -128,7 +181,7 @@ export default function HeroSection({ onScrollToCarousel }) {
     return () => {
       cancelAnimationFrame(animationFrameId);
     };
-  }, [isLoaded, images]);
+  }, []);
 
   // Window Text Zoom Math
   const titleScale = 1 + scrollProgress * 2.0;
@@ -140,16 +193,12 @@ export default function HeroSection({ onScrollToCarousel }) {
     Math.max((0.85 - scrollProgress) * 3.5, 0)
   );
 
-  // =========================================================================
-  // PROCEDURAL ORGANIC LUMINOUS CLOUD TRANSITION MATH (progress 0.70 -> 1.0)
-  // =========================================================================
+  // Procedural Cloud Transition Math
   const cloudProgress = Math.min(Math.max((scrollProgress - 0.70) * 3.33, 0), 1);
-  
-  // Parallax movement offsets for organic cloud blobs
-  const cloudLeftX = (1 - cloudProgress) * -60;   // moves from -60% to 0%
-  const cloudRightX = (1 - cloudProgress) * 60;   // moves from 60% to 0%
-  const cloudTopY = (1 - cloudProgress) * -50;     // moves from -50% to 0%
-  const cloudBottomY = (1 - cloudProgress) * 50;   // moves from 50% to 0%
+  const cloudLeftX = (1 - cloudProgress) * -60;
+  const cloudRightX = (1 - cloudProgress) * 60;
+  const cloudTopY = (1 - cloudProgress) * -50;
+  const cloudBottomY = (1 - cloudProgress) * 50;
 
   return (
     <div ref={containerRef} id="hero" className="relative w-full h-[330vh] bg-black">
@@ -157,24 +206,16 @@ export default function HeroSection({ onScrollToCarousel }) {
       {/* Sticky Viewport */}
       <div className="sticky top-0 left-0 w-full h-screen overflow-hidden">
         
-        {/* Preloader */}
-        {!isLoaded && (
-          <div className="absolute inset-0 z-50 bg-black flex flex-col items-center justify-center p-6 transition-opacity duration-700">
-            <div className="relative w-14 h-14 mb-6 flex items-center justify-center">
+        {/* Instant Micro-Loader (Disappears as soon as Frame 0 is ready) */}
+        {!isInitialReady && (
+          <div className="absolute inset-0 z-50 bg-black flex flex-col items-center justify-center p-6 transition-opacity duration-300">
+            <div className="relative w-12 h-12 mb-4 flex items-center justify-center">
               <div className="absolute inset-0 rounded-full border-t border-white/80 animate-spin" />
               <Compass className="w-5 h-5 text-white/70" />
             </div>
-            
-            <h2 className="font-serif-heading text-lg font-medium tracking-widest text-white/80 mb-4">
+            <h2 className="font-serif-heading text-base font-medium tracking-widest text-white/80">
               JHARKHAND
             </h2>
-
-            <div className="w-40 h-0.5 bg-white/10 rounded-full overflow-hidden">
-              <div 
-                className="h-full bg-white rounded-full transition-all duration-300"
-                style={{ width: `${(loadedCount / TOTAL_FRAMES) * 100}%` }}
-              />
-            </div>
           </div>
         )}
 
@@ -232,7 +273,7 @@ export default function HeroSection({ onScrollToCarousel }) {
         {/* RIGHT SIDE FLOATING CARD */}
         {/* ========================================================================= */}
         <div 
-          className="absolute right-6 md:right-14 top-1/2 -translate-y-1/2 z-20 max-w-xs pointer-events-none transition-all duration-500 hw-accelerated"
+          className="absolute right-6 md:left-auto md:right-14 top-1/2 -translate-y-1/2 z-20 max-w-xs pointer-events-none transition-all duration-500 hw-accelerated"
           style={{
             opacity: sideOverlayOpacity,
             transform: `translateY(-50%) translateX(${(1 - sideOverlayOpacity) * 35}px)`
@@ -256,20 +297,17 @@ export default function HeroSection({ onScrollToCarousel }) {
 
         {/* ========================================================================= */}
         {/* PROCEDURAL ORGANIC LUMINOUS MOUNTAIN CLOUD TRANSITION OVERLAY */}
-        {/* Pure organic cloud shapes: Lighter, feather-soft, semi-transparent, NO square edges */}
         {/* ========================================================================= */}
         {cloudProgress > 0.01 && (
           <div 
             className="absolute inset-0 z-40 pointer-events-none overflow-hidden hw-accelerated transition-opacity duration-300"
             style={{ opacity: cloudProgress }}
           >
-            {/* Soft Ambient Volumetric Fog Layer */}
             <div 
               className="absolute inset-0 bg-gradient-to-b from-slate-900/40 via-white/10 to-slate-950/80 backdrop-blur-lg"
               style={{ opacity: cloudProgress * 0.75 }}
             />
 
-            {/* Cloud Puff 1 - Top Left Mass */}
             <div 
               className="absolute -top-1/4 -left-1/4 w-[75vw] h-[75vh] procedural-cloud-puff hw-accelerated"
               style={{
@@ -278,7 +316,6 @@ export default function HeroSection({ onScrollToCarousel }) {
               }}
             />
 
-            {/* Cloud Puff 2 - Top Right Mass */}
             <div 
               className="absolute -top-1/4 -right-1/4 w-[80vw] h-[80vh] procedural-cloud-puff hw-accelerated"
               style={{
@@ -287,7 +324,6 @@ export default function HeroSection({ onScrollToCarousel }) {
               }}
             />
 
-            {/* Cloud Puff 3 - Center Bottom Rising Mist */}
             <div 
               className="absolute -bottom-1/3 left-1/2 -translate-x-1/2 w-[110vw] h-[85vh] procedural-cloud-puff-soft hw-accelerated"
               style={{
@@ -296,7 +332,6 @@ export default function HeroSection({ onScrollToCarousel }) {
               }}
             />
 
-            {/* Cloud Puff 4 - Center Luminous Mist Core */}
             <div 
               className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[90vw] h-[65vh] procedural-cloud-puff hw-accelerated"
               style={{
