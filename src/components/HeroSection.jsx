@@ -2,93 +2,49 @@ import React, { useRef, useEffect, useState } from 'react';
 import { ChevronDown, Trees, Waves, Compass } from 'lucide-react';
 
 const TOTAL_FRAMES = 240;
-const KEYFRAME_STEP = 3; // Preload keyframes first (1 out of 3) for instant interaction
 
 export default function HeroSection({ onScrollToCarousel }) {
   const containerRef = useRef(null);
   const canvasRef = useRef(null);
   
-  // Store loaded images map: index -> HTMLImageElement
-  const imagesMapRef = useRef(new Map());
-  const [loadedCount, setLoadedCount] = useState(0);
+  // Fixed array storing loaded HTMLImageElement instances (Zero React state re-renders!)
+  const framesRef = useRef(new Array(TOTAL_FRAMES).fill(null));
   const [isInitialReady, setIsInitialReady] = useState(false);
   const [scrollProgress, setScrollProgress] = useState(0);
 
   const currentFrameRef = useRef(0);
   const targetFrameRef = useRef(0);
 
-  // Progressive Frame Loader: Instant rendering + Background Batch Loading
+  // High-Performance Frame Preloader (Zero State Updates during loading)
   useEffect(() => {
     let isMounted = true;
-    let count = 0;
 
-    // Helper to load a single frame
-    const loadFrame = (frameIndex) => {
-      return new Promise((resolve) => {
-        const img = new Image();
-        const frameNum = String(frameIndex + 1).padStart(3, '0');
-        img.src = `/hero_images/ezgif-frame-${frameNum}.jpg`;
-
-        img.onload = () => {
-          if (!isMounted) return;
-          imagesMapRef.current.set(frameIndex, img);
-          count++;
-          setLoadedCount(count);
-          resolve(img);
-        };
-
-        img.onerror = () => {
-          if (!isMounted) return;
-          count++;
-          setLoadedCount(count);
-          resolve(null);
-        };
-      });
+    // Load Frame 0 first for instant canvas display
+    const img0 = new Image();
+    img0.src = '/hero_images/ezgif-frame-001.jpg';
+    img0.onload = () => {
+      if (!isMounted) return;
+      framesRef.current[0] = img0;
+      setIsInitialReady(true);
     };
 
-    // Phase 1: Load Frame 0 INSTANTLY so canvas displays in < 50ms
-    loadFrame(0).then(() => {
-      if (isMounted) setIsInitialReady(true);
-    });
-
-    // Phase 2: Load Keyframes (every 3rd frame) in parallel for immediate smooth scroll responsiveness (~80 frames)
-    const keyframeIndices = [];
-    for (let i = 0; i < TOTAL_FRAMES; i += KEYFRAME_STEP) {
-      if (i !== 0) keyframeIndices.push(i);
-    }
-
-    Promise.all(keyframeIndices.map((idx) => loadFrame(idx))).then(() => {
-      if (!isMounted) return;
-
-      // Phase 3: Fill in remaining intermediate frames lazily in background batches
-      const remainingIndices = [];
-      for (let i = 0; i < TOTAL_FRAMES; i++) {
-        if (!imagesMapRef.current.has(i)) {
-          remainingIndices.push(i);
-        }
-      }
-
-      // Load remaining in small batches of 15 to keep main thread fast & unblocked
-      const loadInBatches = async () => {
-        const BATCH_SIZE = 15;
-        for (let i = 0; i < remainingIndices.length; i += BATCH_SIZE) {
-          if (!isMounted) break;
-          const batch = remainingIndices.slice(i, i + BATCH_SIZE);
-          await Promise.all(batch.map((idx) => loadFrame(idx)));
-          // Yield to main thread briefly
-          await new Promise((r) => setTimeout(r, 40));
-        }
+    // Load remaining frames in parallel without triggering ANY React state re-renders
+    for (let i = 1; i < TOTAL_FRAMES; i++) {
+      const img = new Image();
+      const frameNum = String(i + 1).padStart(3, '0');
+      img.src = `/hero_images/ezgif-frame-${frameNum}.jpg`;
+      img.onload = () => {
+        if (!isMounted) return;
+        framesRef.current[i] = img;
       };
-
-      loadInBatches();
-    });
+    }
 
     return () => {
       isMounted = false;
     };
   }, []);
 
-  // Smooth scroll calculation
+  // Smooth Passive Scroll Calculation
   useEffect(() => {
     const handleScroll = () => {
       if (!containerRef.current) return;
@@ -112,47 +68,45 @@ export default function HeroSection({ onScrollToCarousel }) {
     return () => window.removeEventListener('scroll', handleScroll);
   }, []);
 
-  // Intelligent Nearest-Frame Canvas Render Loop
+  // Hardware-Accelerated 60 FPS Render Loop (Resize on Event Only)
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d', { alpha: false });
     let animationFrameId;
 
-    // Find closest loaded frame if exact target frame is still downloading
-    const getBestAvailableImage = (targetIndex) => {
-      if (imagesMapRef.current.has(targetIndex)) {
-        return imagesMapRef.current.get(targetIndex);
-      }
+    // Resize canvas ONLY on window resize to avoid browser reflows
+    const updateCanvasSize = () => {
+      if (!canvas) return;
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    };
+
+    updateCanvasSize();
+    window.addEventListener('resize', updateCanvasSize, { passive: true });
+
+    // Helper: Find nearest loaded frame rapidly
+    const getFrame = (idx) => {
+      const frames = framesRef.current;
+      if (frames[idx]) return frames[idx];
       
-      // Search backwards first, then forwards for nearest loaded keyframe
-      for (let delta = 1; delta < TOTAL_FRAMES; delta++) {
-        const prev = targetIndex - delta;
-        if (prev >= 0 && imagesMapRef.current.has(prev)) {
-          return imagesMapRef.current.get(prev);
-        }
-        const next = targetIndex + delta;
-        if (next < TOTAL_FRAMES && imagesMapRef.current.has(next)) {
-          return imagesMapRef.current.get(next);
-        }
+      // Fast fallback to nearby loaded frame
+      for (let offset = 1; offset < 20; offset++) {
+        if (idx - offset >= 0 && frames[idx - offset]) return frames[idx - offset];
+        if (idx + offset < TOTAL_FRAMES && frames[idx + offset]) return frames[idx + offset];
       }
-      return imagesMapRef.current.get(0) || null;
+      return frames[0];
     };
 
     const render = () => {
-      currentFrameRef.current += (targetFrameRef.current - currentFrameRef.current) * 0.085;
+      // Smooth lerp easing
+      currentFrameRef.current += (targetFrameRef.current - currentFrameRef.current) * 0.1;
       const frameIndex = Math.round(currentFrameRef.current);
-      const img = getBestAvailableImage(frameIndex);
+      const img = getFrame(frameIndex);
 
       if (img && img.complete) {
-        const canvasWidth = window.innerWidth;
-        const canvasHeight = window.innerHeight;
-        
-        if (canvas.width !== canvasWidth || canvas.height !== canvasHeight) {
-          canvas.width = canvasWidth;
-          canvas.height = canvasHeight;
-        }
-
+        const canvasWidth = canvas.width;
+        const canvasHeight = canvas.height;
         const imgRatio = img.width / img.height;
         const canvasRatio = canvasWidth / canvasHeight;
 
@@ -180,6 +134,7 @@ export default function HeroSection({ onScrollToCarousel }) {
 
     return () => {
       cancelAnimationFrame(animationFrameId);
+      window.removeEventListener('resize', updateCanvasSize);
     };
   }, []);
 
@@ -206,9 +161,9 @@ export default function HeroSection({ onScrollToCarousel }) {
       {/* Sticky Viewport */}
       <div className="sticky top-0 left-0 w-full h-screen overflow-hidden">
         
-        {/* Instant Micro-Loader (Disappears as soon as Frame 0 is ready) */}
+        {/* Micro Loader */}
         {!isInitialReady && (
-          <div className="absolute inset-0 z-50 bg-black flex flex-col items-center justify-center p-6 transition-opacity duration-300">
+          <div className="absolute inset-0 z-50 bg-black flex flex-col items-center justify-center p-6">
             <div className="relative w-12 h-12 mb-4 flex items-center justify-center">
               <div className="absolute inset-0 rounded-full border-t border-white/80 animate-spin" />
               <Compass className="w-5 h-5 text-white/70" />
